@@ -140,10 +140,9 @@ CSV 的「平均耗时」在**量纲上**与本次实测的差距极不一致，
 ## 6. 复现与文件
 
 ```bash
-cd /root/zf_bench/real_1188B_top20
+cd ../real_1188B_top20
 python3 bench_cases.py                 # 20 例跑测 + 写 bench_results.csv
 python3 verify_semantics.py            # 18 项语义交叉校验
-python3 run_ref_cases.py               # 轻量自检（只打印 shape/耗时，不同步计时）
 ```
 
 * `bench_cases.py` — 基准：建真实 shape 输入 → gate（dtype/shape/有限性/复现性）→ event 计时 → 折算 TFLOP/s、GB/s
