@@ -1,72 +1,63 @@
-"""case17 — MoE permute with mask map (+ permuted probs):  permute_with_mask_map<bf16,float,long,true>
+"""case17（真实形状版）— MoE permute with mask map (+permuted probs): permute_with_mask_map<bf16,float,long,true>
 
-CSV   : 021-1188B-real-ops.csv / sheet 测试对象2 / 第 17 行
-kernel: permute_with_mask_map<__mt_bfloat16, float, long, true>   （最后一个 bool = with_permuted_probs）
-上层   : _moe_permute_mask_map（transformer_engine/pytorch/permutation.py:255，dispatch 掉 tes.moe_permute_mask :312）
-Kernel : transformer_engine/musa/common/permutation/permutation_mask.mu:63-125
-
-真实形状（per-rank）:
-  x          [4096, 8192]   bf16    # num_tokens=4096, hidden=8192
-  row_id_map [4096, 320]    int64   # non-trans 布局（token-major），非选位置 = -1，值 = 目标行号
-  probs      [4096, 320]    fp32    # 稀疏：每行只有 topk=8 个非零
-  ----
-  out            [32768, 8192]  bf16    # 32768 = 4096*topk(8)
-  permuted_probs [32768]        fp32
-
-语义: 每个 token 行被复制到它选中的每个 expert 的目标行（scatter），同时把 probs[t][e] 写到同一目标行。
-      out[row_id_map[t][e]] = x[t], permuted_probs[row_id_map[t][e]] = probs[t][e]  (row_id_map[t][e] != -1)
+形状来源（唯一权威）: 021-1188B-real-ops-11-11-record.xlsx
+  trace: x1w_1188B_128k_ac-full_rank-8.json（seq 131072 / CP 8 / 每卡 16384 tokens）
+  记录: x(16384,8192) + map(16384,320) + probs(16384,320) -> y(R,8192) + pp(R)，R=80,820-99,179/层
+  profiler 真实平均: 3.11 ms
+本版构造: 与 case12 同一确定性 routing_map，R=86,016；probs 稀疏结构与真实一致（每行仅选中处非零）。
+注意: 旧 kernel_cases 版用 TOKENS=4096/TOPK=8（R=32768 满 dispatch），形状作废。
 """
 
 import torch
 import torch.nn as nn
 
-# ---- real per-rank dims (pretrain_1188B_formal_training.sh) ----
-TOKENS = 4096
+# ---- real per-rank dims (xlsx record, 128k seq / CP 8) ----
+TOKENS = 16384
 HID = 8192
 NUM_EXPERTS = 320
-TOPK = 8
-NUM_OUT_TOKENS = TOKENS * TOPK     # 32768
 
 CASE = {
     "id": 17,
     "name": "moe_permute_with_mask_map",
     "kernel": "permute_with_mask_map<__mt_bfloat16, float, long, true>",
-    "upstream": "_moe_permute_mask_map",
     "csv_row": 17,
-    "source": "transformer_engine/pytorch/permutation.py:255; "
-              "transformer_engine/musa/common/permutation/permutation_mask.mu:63",
-    "dtype": "bf16 act / fp32 probs / int64 map",
-    "provenance": "形状由源码+配置直接给出（高）：num_out_tokens = num_tokens*topk（"
-                  "Megatron-LM/megatron/core/transformer/moe/token_dispatcher.py:550）",
+    "profiler_avg_ms": 3.11,
+    "shape_provenance": "021-1188B-real-ops-11-11-record.xlsx (x1w_1188B_128k_ac-full_rank-8.json)",
     "backward": False,
 }
 
 
+def make_routing_map():
+    torch.manual_seed(20261112)
+    sel = torch.argsort(torch.rand(TOKENS, NUM_EXPERTS), dim=-1)[:, :6]
+    rm = torch.zeros(TOKENS, NUM_EXPERTS, dtype=torch.bool)
+    rm.scatter_(1, sel[:, :5], True)
+    extra = (torch.arange(TOKENS) % 4 == 1)
+    extra_rows = extra.nonzero(as_tuple=True)[0]
+    rm[extra_rows] = rm[extra_rows].scatter(1, sel[extra_rows, 5:6], True)  # 行对齐写入
+    assert int(rm.sum()) == 86016
+    return rm, sel
+
+
 def make_row_id_map(routing_map):
-    """routing_map [T,E] bool -> row_id_map [T,E] int64（non-trans，-1 = 未选中）。
-
-    = 每个 expert 段内的序号 + 该 expert 段的全局起始行（各 expert token 数的前缀和）。
-    """
     mask = routing_map.to(torch.int64)
-    within = torch.cumsum(mask, dim=0) - 1                 # [T,E] 段内序号（含自己）
-    counts = mask.sum(dim=0)                               # [E] 每个 expert 的 token 数
-    offset = torch.cumsum(counts, dim=0) - counts          # [E] 每段全局起始行
-    return torch.where(mask > 0, within + offset.unsqueeze(0),
-                       torch.full_like(within, -1))
-
+    within = torch.cumsum(mask, dim=0) - 1
+    counts = mask.sum(dim=0)
+    offset = torch.cumsum(counts, dim=0) - counts
+    return torch.where(mask > 0, within + offset.unsqueeze(0), torch.full_like(within, -1))
 
 
 class Model(nn.Module):
-    """out[dst] = x[t]（dst=row_id_map[t,e]>=0）；permuted_probs[dst] = probs[t,e]."""
+    """out[dst]=x[t]（dst=row_id_map[t,e]>=0）；permuted_probs[dst]=probs[t,e]。"""
 
-    def __init__(self, num_experts=NUM_EXPERTS, num_out_tokens=NUM_OUT_TOKENS):
+    def __init__(self, num_experts=NUM_EXPERTS, num_out_tokens=86016):
         super().__init__()
         self.num_experts = num_experts
         self.num_out = num_out_tokens
 
     def forward(self, x: torch.Tensor, row_id_map: torch.Tensor, probs: torch.Tensor):
         n, e = row_id_map.shape
-        dst = row_id_map.reshape(-1)                         # token-major 展平
+        dst = row_id_map.reshape(-1)
         keep = dst >= 0
         tok = torch.arange(n, device=x.device).repeat_interleave(e)
         src_rows = tok[keep]
@@ -81,15 +72,19 @@ class Model(nn.Module):
 
 
 def get_init_inputs():
-    return [NUM_EXPERTS, NUM_OUT_TOKENS]
+    return [NUM_EXPERTS, 86016]
 
 
 def get_inputs():
-    rm = torch.zeros(TOKENS, NUM_EXPERTS, dtype=torch.bool)
-    idx = torch.argsort(torch.rand(TOKENS, NUM_EXPERTS), dim=-1)[:, :TOPK]
-    rm.scatter_(1, idx, True)
+    rm, sel = make_routing_map()
     row_id_map = make_row_id_map(rm)
+    r_rows = int(rm.sum())
+    assert r_rows == 86016
+    torch.manual_seed(20261114)
     x = torch.randn(TOKENS, HID).to(torch.bfloat16)
     probs = torch.zeros(TOKENS, NUM_EXPERTS, dtype=torch.float32)
-    probs.scatter_(1, idx, torch.rand(TOKENS, TOPK, dtype=torch.float32))
+    vals = torch.rand(TOKENS, 5, dtype=torch.float32)
+    probs.scatter_(1, sel[:, :5], vals)
+    extra = (torch.arange(TOKENS) % 4 == 1)
+    probs[extra] = probs[extra].scatter(1, sel[extra, 5:6], torch.rand(int(extra.sum()), 1))
     return [x, row_id_map, probs]

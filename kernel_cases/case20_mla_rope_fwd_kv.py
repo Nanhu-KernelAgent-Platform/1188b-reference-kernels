@@ -1,59 +1,38 @@
-"""case20 — MLA YaRN RoPE forward for K/V:  rotary_fwd_kv_kernel
+"""case20（真实形状版）— MLA YaRN RoPE forward for K/V: rotary_fwd_kv_kernel
 
-CSV   : 021-1188B-real-ops.csv / sheet 测试对象2 / 第 20 行
-kernel: rotary_fwd_kv_kernel
-上层   : ApplyMLARotaryEmbKV（Megatron-LM/megatron/core/fusions/fused_mla_yarn_rope_apply.py:
-         kernel 定义第 392 行，autograd.Function 第 595 行，wrapper 第 749 行）
-调用点 : Megatron-LM/megatron/core/transformer/multi_latent_attention.py:892
-         （self.config.apply_rope_fusion，kv 已经过 linear_kv_up_proj 上投影）
-
-真实形状（per-rank，TP=1 / CP=1 / micro-batch=1 / sbhd 格式）:
-  kv        [4096, 1, 128, 256]   bf16    # 256 = qk_head_dim(128) + v_head_dim(128)
-  k_pos_emb [4096, 1, 1,   64]    bf16    # qk_pos_emb_head_dim = 64，按 head 广播
-  cos / sin [4096, 1, 1,   64]    fp32    # YaRN 表，max_position_embeddings = seq 4096
-  --------
-  key       [4096, 1, 128, 192]   bf16    # 192 = qk_head_dim(128) + emb(64)
-  value     [4096, 1, 128, 128]   bf16
-
-语义（kernel 原文，fused_mla_yarn_rope_apply.py:425-489）:
-  k = kv[..., :k_dim]        -> key[..., k_dim:]          （原样搬运）
-  v = kv[..., k_dim:]        -> value[..., :]             （原样搬运）
-  x  = k_pos_emb[..., :emb]  （每 head 广播）
-  HALF-SPLIT（非 interleaved）旋转，even/odd 拆分:
-      x1 = x[0::2], x2 = x[1::2]
-      key[..., k_dim : k_dim+emb/2]     = x1*cos[:emb/2] - x2*sin[:emb/2]
-      key[..., k_dim+emb/2 : k_dim+emb] = x2*cos[emb/2:] + x1*sin[emb/2:]
-  注意: rope 结果放在 key 的 *尾部*，k 在前 —— 与 q 的布局（rope 在尾部）一致。
+形状来源（唯一权威）: 021-1188B-real-ops-11-11-record.xlsx
+  trace: x1w_1188B_128k_ac-full_rank-8.json（seq 131072 / CP 8 / 每卡 16384 tokens）
+  记录: kv(16384,1,128,256) + k_pos_emb(16384,1,1,64) + cos,sin(16384,1,1,64)
+        -> key(16384,1,128,192) + value(16384,1,128,128)
+  profiler 真实平均: 2.09 ms
+  自洽校核: 读 1.07GB + 写 1.34GB ≈ 2.42GB/次。
+注意: 旧 kernel_cases 版 SEQ=4096，作废；语义与 rope 旋转结构不变，仅 S 4096->16384。
 """
 
 import torch
 import torch.nn as nn
 
-# ---- real per-rank dims (pretrain_1188B_formal_training.sh) ----
-SEQ = 4096
+# ---- real per-rank dims (xlsx record, 128k seq / CP 8) ----
+SEQ = 16384
 BATCH = 1
 NHEADS = 128
-K_DIM = 128        # qk_head_dim（k_nope 上投影后的 key 部分）
-V_DIM = 128        # v_head_dim
-EMB = 64           # qk_pos_emb_head_dim
+K_DIM = 128
+V_DIM = 128
+EMB = 64
 
 CASE = {
     "id": 20,
     "name": "mla_rope_fwd_kv",
     "kernel": "rotary_fwd_kv_kernel",
-    "upstream": "ApplyMLARotaryEmbKV",
     "csv_row": 20,
-    "source": "Megatron-LM/megatron/core/fusions/fused_mla_yarn_rope_apply.py:392,595,749; "
-              "call site Megatron-LM/megatron/core/transformer/multi_latent_attention.py:892",
-    "dtype": "bf16 数据 / fp32 cos-sin 表",
-    "provenance": "形状由源码 docstring + 调用点直接给出（高）；"
-                  "seq=4096/max_position_embeddings=4096 来自训练脚本（高）",
+    "profiler_avg_ms": 2.09,
+    "shape_provenance": "021-1188B-real-ops-11-11-record.xlsx (x1w_1188B_128k_ac-full_rank-8.json)",
     "backward": False,
 }
 
 
 class Model(nn.Module):
-    """key = cat([kv[..., :K_DIM], rope(k_pos_emb)], -1), value = kv[..., K_DIM:]（rope 按 head 广播）."""
+    """key = cat([kv[..., :K_DIM], rope(k_pos_emb)], -1), value = kv[..., K_DIM:]（half-split 旋转，按 head 广播）。"""
 
     def __init__(self, k_dim=K_DIM, v_dim=V_DIM, emb=EMB):
         super().__init__()
@@ -66,14 +45,14 @@ class Model(nn.Module):
         k = kv[..., : self.k_dim]
         v = kv[..., self.k_dim: self.k_dim + self.v_dim]
         half = self.emb // 2
-        x = k_pos_emb.float()                      # [S,B,1,emb]
-        x1, x2 = x[..., 0::2], x[..., 1::2]         # even / odd
+        x = k_pos_emb.float()
+        x1, x2 = x[..., 0::2], x[..., 1::2]
         c1, s1 = cos[..., :half], sin[..., :half]
         c2, s2 = cos[..., half:], sin[..., half:]
         left = x1 * c1 - x2 * s1
         right = x2 * c2 + x1 * s2
-        rope = torch.cat([left, right], dim=-1)     # [S,B,1,emb]
-        rope = rope.expand(-1, -1, k.shape[-2], -1)  # 广播到 128 个 head
+        rope = torch.cat([left, right], dim=-1)
+        rope = rope.expand(-1, -1, k.shape[-2], -1)
         key = torch.cat([k, rope.to(k.dtype)], dim=-1)
         return key, v
 
@@ -83,11 +62,12 @@ def get_init_inputs():
 
 
 def get_inputs():
+    torch.manual_seed(20261120)
     kv = torch.randn(SEQ, BATCH, NHEADS, K_DIM + V_DIM).to(torch.bfloat16)
     k_pos_emb = torch.randn(SEQ, BATCH, 1, EMB).to(torch.bfloat16)
     theta = 1.0 / (10000.0 ** (torch.arange(0, EMB, 2, dtype=torch.float32) / EMB))
     pos = torch.arange(SEQ, dtype=torch.float32)
-    ang = pos[:, None] * theta[None, :]              # [S, emb/2]
+    ang = pos[:, None] * theta[None, :]
     cos = torch.cat([ang.cos(), ang.cos()], dim=-1).view(SEQ, 1, 1, EMB)
     sin = torch.cat([ang.sin(), ang.sin()], dim=-1).view(SEQ, 1, 1, EMB)
     return [kv, k_pos_emb, cos, sin]
