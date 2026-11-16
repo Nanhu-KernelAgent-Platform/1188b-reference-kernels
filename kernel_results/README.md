@@ -1,6 +1,6 @@
-# 1188B 真实算子优化 kernel（5 个）关键信息总结
+# 1188B 真实算子优化 kernel 关键信息总结
 
-5 个 1188B 训练热点算子的 MUSA 优化 kernel。每个子目录含且仅含 4 个源文件：
+目前有5个1188B 训练热点算子的 MUSA 优化 kernel。每个子目录含且仅含 4 个源文件：
 `binding.cpp`（pybind 绑定）/ `kernel.mu`（MUSA 设备核）/ `kernel.py`（`kernel_function` 入口）/ `setup.py`（torch_musa 扩展编译）。
 
 ## 性能与精度（验收实测）
@@ -35,7 +35,3 @@ import sys
 sys.path.insert(0, 'kernel_results/case17_moe_permute_with_mask_map')
 from kernel import kernel_function   # (x, row_id_map, probs) -> (out[R,H], permuted_probs[R])
 ```
-
-完整验收记录（口径定义/复测命令/三档阈值余量）见内部备份
-`real_1188B_ops/best_opt_results/TEST_REPORT_e-5.md`；reference 与计时器见
-`real_1188B_ops/real_shape_1188B_reference/`。
